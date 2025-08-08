@@ -1,13 +1,10 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 '''
 mavlink python parse functions
 
 Copyright Andrew Tridgell 2011
 Released under GNU GPL version 3 or later
 '''
-from __future__ import print_function
-from builtins import range
-from builtins import object
 
 import errno
 import operator
@@ -289,6 +286,14 @@ class MAVXML(object):
                     has_location = False
                 if type(has_location) != bool:
                     raise MAVParseError("invalid has_location value %s" % has_location)
+
+                # check bitmask value
+                if self.enum[-1].bitmask:
+                    # values should always be a power of 2.  Py3.10
+                    # has value.bit_count()
+                    if bin(value).count("1") != 1:
+                        print(f"{attrs['name']} has invalid values (bitmask must have powers of 2)")
+
                 # append the new entry
                 self.enum[-1].entry.append(MAVEnumEntry(attrs['name'], value, '', False, autovalue, self.filename, p.CurrentLineNumber, has_location=has_location))
             elif in_element == "mavlink.enums.enum.entry.param":

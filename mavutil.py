@@ -5,8 +5,6 @@ mavlink python utility functions
 Copyright Andrew Tridgell 2011-2019
 Released under GNU LGPL version 3 or later
 '''
-from __future__ import print_function
-from builtins import object
 
 import socket, math, struct, time, os, fnmatch, array, sys, errno
 import select
@@ -15,21 +13,16 @@ import json
 import re
 import platform
 from pymavlink import mavexpression
+import ssl
 
 # We want to re-export x25crc here
 from pymavlink.generator.mavcrc import x25crc as x25crc
-
-is_py3 = sys.version_info >= (3,0)
-supports_type_annotations = sys.version_info >= (3,6)
 
 # adding these extra imports allows pymavlink to be used directly with pyinstaller
 # without having complex spec files. To allow for installs that don't have ardupilotmega
 # at all we avoid throwing an exception if it isn't installed
 try:
-    if supports_type_annotations:
-        from pymavlink.dialects.v10 import ardupilotmega
-    else:
-        from pymavlink.dialects.v10.python2 import ardupilotmega
+    from pymavlink.dialects.v10 import ardupilotmega
 except Exception:
     pass
 
@@ -76,9 +69,7 @@ def evaluate_condition(condition, vars):
     return v
 
 def u_ord(c):
-    if is_py3:
-        return c
-    return ord(c)
+    return c
 
 class location(object):
     '''represent a GPS coordinate'''
@@ -117,26 +108,25 @@ def set_dialect(dialect, with_type_annotations=None):
     global mavlink, current_dialect
     from .generator import mavparse
 
-    if with_type_annotations is None:
-        with_type_annotations = supports_type_annotations
+    if with_type_annotations is not None:
+        print("with_type_annotations ignored; remove parameter")
 
-    legacy_python_module = "python2." if not with_type_annotations else ""
     if 'MAVLINK20' in os.environ:
         wire_protocol = mavparse.PROTOCOL_2_0
-        modname = "pymavlink.dialects.v20." + legacy_python_module + dialect
+        modname = "pymavlink.dialects.v20." + dialect
     elif mavlink is None or mavlink.WIRE_PROTOCOL_VERSION == "1.0" or not 'MAVLINK09' in os.environ:
         wire_protocol = mavparse.PROTOCOL_1_0
-        modname = "pymavlink.dialects.v10." + legacy_python_module + dialect
+        modname = "pymavlink.dialects.v10." + dialect
     else:
         wire_protocol = mavparse.PROTOCOL_0_9
-        modname = "pymavlink.dialects.v09." + legacy_python_module + dialect
+        modname = "pymavlink.dialects.v09." + dialect
 
     try:
         mod = __import__(modname)
     except Exception:
         # auto-generate the dialect module
         from .generator.mavgen import mavgen_python_dialect
-        mavgen_python_dialect(dialect, wire_protocol, with_type_annotations=with_type_annotations)
+        mavgen_python_dialect(dialect, wire_protocol)
         mod = __import__(modname)
     components = modname.split('.')
     for comp in components[1:]:
@@ -321,12 +311,18 @@ class mavfile(object):
         (callback, callback_args, callback_kwargs) = (self.mav.callback,
                                                       self.mav.callback_args,
                                                       self.mav.callback_kwargs)
+        (send_callback, send_callback_args, send_callback_kwargs) = (self.mav.send_callback,
+                                                                     self.mav.send_callback_args,
+                                                                     self.mav.send_callback_kwargs)
         self.mav = mavlink.MAVLink(self, srcSystem=self.source_system, srcComponent=self.source_component)
         self.mav.robust_parsing = self.robust_parsing
         self.WIRE_PROTOCOL_VERSION = mavlink.WIRE_PROTOCOL_VERSION
         (self.mav.callback, self.mav.callback_args, self.mav.callback_kwargs) = (callback,
                                                                                  callback_args,
                                                                                  callback_kwargs)
+        (self.mav.send_callback, self.mav.send_callback_args, self.mav.send_callback_kwargs) = (send_callback,
+                                                                                                send_callback_args,
+                                                                                                send_callback_kwargs)
 
     def recv(self, n=None):
         '''default recv method'''
@@ -431,9 +427,7 @@ class mavfile(object):
                 # lock onto id tuple of first vehicle heartbeat
                 self.sysid = src_system
             if float(mavlink.WIRE_PROTOCOL_VERSION) >= 1:
-                self.flightmode = mode_string_v10(msg)
-                self.mav_type = msg.type
-                self.base_mode = msg.base_mode
+                self.sysid_state[src_system].flightmode = mode_string_v10(msg)
                 self.sysid_state[src_system].armed = (msg.base_mode & mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
                 self.sysid_state[src_system].mav_type = msg.type
                 self.sysid_state[src_system].mav_autopilot = msg.autopilot
@@ -441,11 +435,10 @@ class mavfile(object):
             if self.sysid == 0:
                 # lock onto id tuple of first vehicle heartbeat
                 self.sysid = src_system
-            self.flightmode = mode_string_v10(msg)
-            self.mav_type = msg.type
             if msg.autopilot == mavlink.MAV_AUTOPILOT_ARDUPILOTMEGA:
-                self.base_mode = msg.custom0
+                self.sysid_state[src_system].base_mode = msg.custom0
                 self.sysid_state[src_system].armed = (msg.custom0 & mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+            self.sysid_state[src_system].flightmode = mode_string_v10(msg)
             self.sysid_state[src_system].mav_type = msg.type
             self.sysid_state[src_system].mav_autopilot = msg.autopilot
 
@@ -454,7 +447,7 @@ class mavfile(object):
                 self.param_state[src_tuple] = param_state()
             self.param_state[src_tuple].params[msg.param_id] = msg.param_value
         elif type == 'SYS_STATUS' and mavlink.WIRE_PROTOCOL_VERSION == '0.9':
-            self.flightmode = mode_string_v09(msg)
+            self.sysid_state[src_system].flightmode = mode_string_v09(msg)
         elif type == 'GPS_RAW':
             if self.sysid_state[src_system].messages['HOME'].fix_type < 2:
                 self.sysid_state[src_system].messages['HOME'] = msg
@@ -490,10 +483,7 @@ class mavfile(object):
 
             if numnew != 0:
                 if self.logfile_raw:
-                    if is_py3:
-                        self.logfile_raw.write(s)
-                    else:
-                        self.logfile_raw.write(str(s))
+                    self.logfile_raw.write(s)
                 if self.first_byte:
                     self.auto_mavlink_version(s)
 
@@ -503,10 +493,7 @@ class mavfile(object):
             if msg:
                 if self.logfile and  msg.get_type() != 'BAD_DATA' :
                     usec = int(time.time() * 1.0e6) & ~3
-                    if is_py3:
-                        self.logfile.write(struct.pack('>Q', usec) + msg.get_msgbuf())
-                    else:
-                        self.logfile.write(str(struct.pack('>Q', usec) + msg.get_msgbuf()))
+                    self.logfile.write(struct.pack('>Q', usec) + msg.get_msgbuf())
                 self.post_message(msg)
                 return msg
             else:
@@ -583,7 +570,7 @@ class mavfile(object):
             idx = int(name)
             self.mav.param_request_read_send(self.target_system, self.target_component, b"", idx)
         except Exception:
-            if sys.version_info.major >= 3 and not isinstance(name, bytes):
+            if not isinstance(name, bytes):
                 name = bytes(name,'ascii')
             self.mav.param_request_read_send(self.target_system, self.target_component, name, -1)
 
@@ -950,7 +937,7 @@ def set_close_on_exec(fd):
     except Exception:
         pass
 
-class FakeSerial():
+class FakeSerial:
     def __init__(self):
         pass
     def read(self, len):
@@ -1807,7 +1794,7 @@ class mavwebsocket(mavfile):
             # Should probbily raise a exception of some sort
             return ''
 
-        # Read in some data and pass it to the WebSocket handeler
+        # Read in some data and pass it to the WebSocket handler
         RECEIVE_BYTES = 4096
         try:
             in_data = self.port.recv(RECEIVE_BYTES)
@@ -1821,7 +1808,7 @@ class mavwebsocket(mavfile):
             self.close_port()
             return ''
 
-        # Procces WebSocket events
+        # Process WebSocket events
         data = b""
         reply = b""
         keep_running = True
@@ -1840,7 +1827,7 @@ class mavwebsocket(mavfile):
                 data += event.data
 
         if len(reply) > 0:
-            # Send any reply to incomming requests
+            # Send any reply to incoming requests
             self.port.send(reply)
 
         if not keep_running:
@@ -1866,6 +1853,159 @@ class mavwebsocket(mavfile):
             if e.errno in [ errno.EPIPE ]:
                 self.close_port()
             pass
+
+
+class mavwebsocket_client(mavfile):
+    '''client using WebSocket over TCP with WS and WSS support'''
+    def __init__(self,
+                 device,
+                 source_system=255,
+                 source_component=0,
+                 retries=6,
+                 use_native=default_native):
+        self.resource = "/"
+        a = device.split(':')
+        protocol = a[0]
+        if len(a) < 3:
+            raise ValueError("WebSocket ports must be specified as protocol:host:port")
+        self.host = a[1]
+        self.port = int(a[2])
+        if len(a) > 3:
+            self.resource = a[3]
+        self.sock = None
+        self.use_ssl = protocol.lower() == 'wss'
+        self.connect()
+        mavfile.__init__(self, self.sock.fileno(), device, source_system=source_system, source_component=source_component, use_native=use_native)
+
+    def connect(self):
+        self.close()
+        from wsproto import ConnectionType, WSConnection
+        from wsproto.events import (
+            AcceptConnection,
+            CloseConnection,
+            Request,
+            BytesMessage,
+        )
+        try:
+            # Create basic socket connection
+            raw_sock = socket.create_connection((self.host, self.port))
+            
+            # Wrap with SSL if using WSS
+            if self.use_ssl:
+                context = ssl.create_default_context()
+                # Optional: For testing with self-signed certificates, uncomment:
+                # context.check_hostname = False
+                # context.verify_mode = ssl.CERT_NONE
+                self.sock = context.wrap_socket(raw_sock, server_hostname=self.host)
+            else:
+                self.sock = raw_sock
+
+        except socket.error as e:
+            if e.errno in [errno.ECONNREFUSED, errno.EHOSTUNREACH]:
+                self.close()
+                return
+            raise
+        except ssl.SSLError as e:
+            print(f"SSL Error: {e}")
+            self.close()
+            raise
+
+        self.fd = self.sock.fileno()
+        self.sock.setblocking(1)
+        self.ws = WSConnection(ConnectionType.CLIENT)
+        b = self.ws.send(Request(host=self.host, target=self.resource))
+        self.sock.send(b)
+        self.buffer = b''
+        
+        # wait for handshake response
+        while True:
+            try:
+                data = self.sock.recv(4096)
+            except ssl.SSLError as e:
+                raise RuntimeError(f"WebSocket SSL handshake failed: {e}")
+            except socket.error as e:
+                raise RuntimeError(f"WebSocket handshake failed: {e}")
+                
+            if not data:
+                raise RuntimeError("WebSocket handshake failed")
+            self.ws.receive_data(data)
+            for event in self.ws.events():
+                if isinstance(event, AcceptConnection):
+                    self.sock.setblocking(0)
+                    return
+
+    def recv(self, n=None):
+        from wsproto.events import (
+            BytesMessage,
+            CloseConnection
+        )
+        if not self.sock:
+            self.connect()
+            return b''
+        if self.buffer:
+            out, self.buffer = self.buffer, b''
+            return out
+        if n is None:
+            n = self.mav.bytes_needed()
+        try:
+            data = self.sock.recv(n)
+        except ssl.SSLError as e:
+            # Handle SSL-specific errors
+            if e.errno == ssl.SSL_ERROR_WANT_READ:
+                return b""  # Need more data, try again later
+            elif e.errno == ssl.SSL_ERROR_WANT_WRITE:
+                return b""  # SSL needs to write, try again later
+            elif e.errno in [errno.EAGAIN, errno.EWOULDBLOCK]:
+                return b""
+            else:
+                # Real SSL error, reconnect
+                self.connect()
+                return b''
+        except socket.error as e:
+            if e.errno in [errno.EAGAIN, errno.EWOULDBLOCK]:
+                return b""
+            if e.errno in [errno.ECONNRESET, errno.EPIPE]:
+                self.connect()
+                return b''
+            raise
+        if not data:
+            return b''
+        self.ws.receive_data(data)
+        for event in self.ws.events():
+            if isinstance(event, BytesMessage):
+                self.buffer += event.data
+            elif isinstance(event, CloseConnection):
+                return b''
+        out, self.buffer = self.buffer, b''
+        return out
+
+    def write(self, data):
+        from wsproto.events import BytesMessage
+        if not self.sock:
+            self.connect()
+            return
+        b = self.ws.send(BytesMessage(data=data))
+        try:
+            self.sock.send(b)
+        except ssl.SSLError as e:
+            # Handle SSL-specific errors
+            if e.errno == ssl.SSL_ERROR_WANT_READ:
+                return  # SSL needs to read, try again later
+            elif e.errno == ssl.SSL_ERROR_WANT_WRITE:
+                return  # SSL needs to write, try again later
+            else:
+                # Real SSL error, reconnect
+                self.connect()
+        except socket.error as e:
+            if e.errno in [errno.EPIPE]:
+                self.connect()
+            pass
+
+    def close(self):
+        if self.sock:
+            self.sock.close()
+            self.sock = None
+        self.fd = None
 
 
 def mavlink_connection(device, baud=115200, source_system=255, source_component=0,
@@ -1901,6 +2041,8 @@ def mavlink_connection(device, baud=115200, source_system=255, source_component=
         return mavudp(device[9:], input=False, source_system=source_system, source_component=source_component, use_native=use_native, broadcast=True)
     if device.startswith('wsserver:'):
         return mavwebsocket(device[9:], source_system=source_system, source_component=source_component, use_native=use_native)
+    if device.startswith('ws:') or device.startswith('wss:'):
+        return mavwebsocket_client(device, source_system=source_system, source_component=source_component, use_native=use_native)
     # For legacy purposes we accept the following syntax and let the caller to specify direction
     if device.startswith('udp:'):
         return mavudp(device[4:], input=input, source_system=source_system, source_component=source_component, use_native=use_native)
@@ -2189,6 +2331,8 @@ mode_mapping_acm = {
     25 : 'SYSTEMID',
     26 : 'AUTOROTATE',
     27 : 'AUTO_RTL',
+    28 : 'TURTLE',
+    29 : 'RATE_ACRO',
 }
 
 mode_mapping_rover = {
@@ -2315,7 +2459,7 @@ except Exception:
 # map from a PX4 "main_state" to a string; see msg/commander_state.msg
 # This allows us to map sdlog STAT.MainState to a simple "mode"
 # string, used in DFReader and possibly other places.  These are
-# related but distict from what is found in mavlink messages; see
+# related but distinct from what is found in mavlink messages; see
 # "Custom mode definitions", below.
 mainstate_mapping_px4 = {
     0 : 'MANUAL',
@@ -2630,7 +2774,20 @@ def dump_message_verbose(f, m):
         timestamp = "%s.%02u: " % (
             time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(timestamp)),
             int(timestamp*100.0)%100)
-    f.write("%s%s (id=%u) (link=%s) (signed=%s) (seq=%u) (src=%u/%u)\n" % (timestamp, m.get_type(), m.get_msgId(), str(m.get_link_id()), str(m.get_signed()), m.get_seq(), m.get_srcSystem(), m.get_srcComponent()))
+    if m.get_signed():
+        signed = f"Yes; out-link={str(m.get_link_id())}"
+    else:
+        signed = "No"
+
+    inbound_link = getattr(m, '_link', None)
+    f.write(
+        f"{timestamp}{m.get_type()} (id={m.get_msgId()}) "
+        f"(seq={m.get_seq()}) "
+        f"(src={m.get_srcSystem()}/{m.get_srcComponent()}) "
+        f"(in-link={inbound_link}) "
+        f"(signed={signed})\n"
+    )
+
     for fieldname in m.get_fieldnames():
 
         # format in those most boring way possible:
